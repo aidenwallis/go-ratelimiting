@@ -15,7 +15,10 @@ var (
 	ErrDuration = errors.New("duration must be more than 0")
 )
 
-// SlidingWindow provides an interface for the sliding window ratelimiter
+// SlidingWindow provides an interface for the sliding window ratelimiter.
+//
+// The sliding window ratelimiter is a fixed size window that holds a set of timestamps. When a token is taken, the current time is added to the window.
+// The window is constantly cleaned, and evicting old tokens, which allows new ones to be added as the window discards old tokens.
 type SlidingWindow interface {
 	// Wait will block the goroutine til a ratelimit token is available. You can use context to cancel the ratelimiter.
 	Wait(ctx context.Context)
@@ -46,7 +49,7 @@ type slidingWindow struct {
 	window []time.Time
 }
 
-// NewSlidingWindow creates a new sliding window ratelimiter.
+// NewSlidingWindow creates a new sliding window ratelimiter. See the SlidingWindow interface for more info about what this ratelimiter does.
 func NewSlidingWindow(capacity int, duration time.Duration) (SlidingWindow, error) {
 	if capacity <= 0 {
 		return nil, ErrCapacity
