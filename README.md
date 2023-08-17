@@ -6,4 +6,7 @@ Ratelimiting libraries in Go.
 
 These ratelimiters are used in production services for [Fossabot](https://fossabot.com), such as Twitch proxies.
 
-This library is light and does not contain any external dependencies, it doesn't try to be the most efficient, but tries to be simple.
+There are two kinds of ratelimiters in this library:
+
+* [**local**](local/README.md): Ratelimiters that are not persistent, and live in-process memory. Useful when you need to throttle a specific function, or some kind of usage within a single container.
+* [**redis**](redis/README.md): Ratelimiters that connect to Redis and provide a distributed solution to your ratelimiting problems. Ideal for stateless, distributed applications, such as APIs.
