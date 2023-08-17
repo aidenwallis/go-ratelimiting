@@ -4,6 +4,12 @@ These ratelimiters are for usage with [Redis](https://redis.io). They're persist
 
 These are used in many places in [Fossabot](https://fossabot.com): including but not limited to API ratelimiting, chat abuse detection, follower alert spam limiting, etc.
 
+## Library Agnostic
+
+Given the fragmented community preferences for Redis clients in Go, this library is designed to be compatible with whatever Redis client you choose, making this library ideal for any Redis-based project you build! We achieve this through the [Adapter](adapters/adapter.go) interface - an adapter is essentially a very thin wrapper around your Redis client.
+
+We provide native support for [go-redis](https://github.com/redis/go-redis) and [redigo](https://github.com/gomodule/redigo), though, you are more than welcome to add support for your own Redis client through the adapter interface. The underlying implementations are extremely simple, feel free to look at the premade ones for a reference point.
+
 ## Example Usage
 
 The following implements a HTTP server that has a handler ratelimited to 300 requests every 60 seconds.
