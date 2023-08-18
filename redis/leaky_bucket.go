@@ -20,6 +20,9 @@ import (
 //
 // See: https://en.wikipedia.org/wiki/Leaky_bucket
 type LeakyBucket interface {
+	// Inspect atomically inspects the leaky bucket and returns the capacity available. It does not take any tokens.
+	Inspect(ctx context.Context, bucket *LeakyBucketOptions) (*InspectLeakyBucketResponse, error)
+
 	// Use atomically attempts to use the leaky bucket. Use takeAmount to set how many tokens should be attempted to be removed
 	// from the bucket: they are atomic, either all tokens are taken, or the ratelimit is unsuccessful.
 	Use(ctx context.Context, bucket *LeakyBucketOptions, takeAmount int) (*UseLeakyBucketResponse, error)
@@ -50,18 +53,6 @@ type LeakyBucketOptions struct {
 	WindowSeconds int
 }
 
-// UseLeakyBucketResponse defines the response parameters for LeakyBucket.Use()
-type UseLeakyBucketResponse struct {
-	// Success is true when we were successfully able to take tokens from the bucket.
-	Success bool
-
-	// RemainingTokens defines hwo many tokens are left in the bucket
-	RemainingTokens int
-
-	// ResetAt is the time at which the bucket will be fully refilled
-	ResetAt time.Time
-}
-
 // LeakyBucketImpl implements a leaky bucket ratelimiter in Redis with Lua. This struct is compatible with the LeakyBucket interface
 //
 // See the LeakyBucket interface for more information about leaky bucket ratelimiters.
@@ -70,6 +61,8 @@ type LeakyBucketImpl struct {
 	Adapter adapters.Adapter
 
 	// nowFunc is a private helper used to mock out time changes in unit testing
+	//
+	// if this is not defined, it falls back to time.Now()
 	nowFunc func() time.Time
 }
 
@@ -86,6 +79,80 @@ func (r *LeakyBucketImpl) now() time.Time {
 		return time.Now()
 	}
 	return r.nowFunc()
+}
+
+// InspectLeakyBucketResponse defines the response parameters for LeakyBucket.Inspect()
+type InspectLeakyBucketResponse struct {
+	// RemainingTokens defines hwo many tokens are left in the bucket
+	RemainingTokens int
+
+	// ResetAt is the time at which the bucket will be fully refilled
+	ResetAt time.Time
+}
+
+// Inspect atomically inspects the leaky bucket and returns the capacity available. It does not take any tokens.
+func (r *LeakyBucketImpl) Inspect(ctx context.Context, bucket *LeakyBucketOptions) (*InspectLeakyBucketResponse, error) {
+	const script = `
+local tokensKey = KEYS[1]
+local lastFillKey = KEYS[2]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local tokens = tonumber(redis.call("get", tokensKey))
+local lastFilled = tonumber(redis.call("get", lastFillKey))
+
+if (tokens == nil) then
+	tokens = 0 -- default empty buckets to 0
+end
+
+if (tokens > capacity) then
+	tokens = capacity -- shrink buckets if the capacity is reduced
+end
+
+if (lastFilled == nil) then
+	lastFilled = 0
+end
+
+if (tokens < capacity) then
+	local tokensToFill = math.floor((now - lastFilled) * rate)
+	if (tokensToFill > 0) then
+		tokens = math.min(capacity, tokens + tokensToFill)
+		lastFilled = now
+	end
+end
+
+return {tokens, lastFilled}
+`
+	refillRate := getRefillRate(bucket.MaximumCapacity, bucket.WindowSeconds)
+	now := r.now().UTC().Unix()
+
+	resp, err := r.Adapter.Eval(ctx, script, []string{tokensKey(bucket.KeyPrefix), lastFillKey(bucket.KeyPrefix)}, []interface{}{bucket.MaximumCapacity, refillRate, now})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query redis adapter: %w", err)
+	}
+
+	output, err := parseInspectLeakyBucketResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("parsing redis response: %w", err)
+	}
+
+	return &InspectLeakyBucketResponse{
+		RemainingTokens: output.remaining,
+		ResetAt:         calculateLeakyBucketFillTime(output.lastFilled, output.remaining, bucket.MaximumCapacity, bucket.WindowSeconds),
+	}, nil
+}
+
+// UseLeakyBucketResponse defines the response parameters for LeakyBucket.Use()
+type UseLeakyBucketResponse struct {
+	// Success is true when we were successfully able to take tokens from the bucket.
+	Success bool
+
+	// RemainingTokens defines hwo many tokens are left in the bucket
+	RemainingTokens int
+
+	// ResetAt is the time at which the bucket will be fully refilled
+	ResetAt time.Time
 }
 
 // Use atomically attempts to use the leaky bucket. Use takeAmount to set how many tokens should be attempted to be removed
@@ -139,15 +206,14 @@ return {success, tokens, lastFilled}
 	refillRate := getRefillRate(bucket.MaximumCapacity, bucket.WindowSeconds)
 	now := r.now().UTC().Unix()
 
-	tokensKey := bucket.KeyPrefix + "::tokens"
-	lastFillKey := bucket.KeyPrefix + "::last_fill"
-
-	resp, err := r.Adapter.Eval(ctx, script, []string{tokensKey, lastFillKey}, []interface{}{bucket.MaximumCapacity, refillRate, now, takeAmount, bucket.WindowSeconds})
+	resp, err := r.Adapter.Eval(ctx, script, []string{tokensKey(bucket.KeyPrefix), lastFillKey(bucket.KeyPrefix)}, []interface{}{
+		bucket.MaximumCapacity, refillRate, now, takeAmount, bucket.WindowSeconds,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query redis adapter: %w", err)
 	}
 
-	output, err := parseLeakyBucketResponse(resp)
+	output, err := parseUseLeakyBucketResponse(resp)
 	if err != nil {
 		return nil, fmt.Errorf("parsing redis response: %w", err)
 	}
@@ -157,6 +223,14 @@ return {success, tokens, lastFilled}
 		RemainingTokens: output.remaining,
 		ResetAt:         calculateLeakyBucketFillTime(output.lastFilled, output.remaining, bucket.MaximumCapacity, bucket.WindowSeconds),
 	}, nil
+}
+
+func tokensKey(prefix string) string {
+	return prefix + "::tokens"
+}
+
+func lastFillKey(prefix string) string {
+	return prefix + "::last_fill"
 }
 
 func calculateLeakyBucketFillTime(lastFillUnix, currentTokens, maxCapacity, windowSeconds int) time.Time {
@@ -182,35 +256,46 @@ func getRefillRate(maxCapacity, windowSeconds int) float64 {
 	return float64(maxCapacity) / float64(windowSeconds)
 }
 
-type leakyBucketOutput struct {
+type useLeakyBucketOutput struct {
 	success    bool
 	remaining  int
 	lastFilled int
 }
 
-func parseLeakyBucketResponse(v interface{}) (*leakyBucketOutput, error) {
-	args, ok := v.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("expected []interface{} but got %T", v)
+func parseUseLeakyBucketResponse(v interface{}) (*useLeakyBucketOutput, error) {
+	ints, err := parseRedisInt64Slice(v)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(args) != 3 {
-		return nil, fmt.Errorf("expected 3 args but got %d", len(args))
+	if len(ints) != 3 {
+		return nil, fmt.Errorf("expected 3 args but got %d", len(ints))
 	}
 
-	argInts := make([]int64, len(args))
-	for i, argValue := range args {
-		intValue, ok := argValue.(int64)
-		if !ok {
-			return nil, fmt.Errorf("expected int64 in arg[%d] but got %T", i, argValue)
-		}
+	return &useLeakyBucketOutput{
+		success:    ints[0] == 1,
+		remaining:  int(ints[1]),
+		lastFilled: int(ints[2]),
+	}, nil
+}
 
-		argInts[i] = intValue
+type inspectLeakyBucketOutput struct {
+	remaining  int
+	lastFilled int
+}
+
+func parseInspectLeakyBucketResponse(v interface{}) (*inspectLeakyBucketOutput, error) {
+	ints, err := parseRedisInt64Slice(v)
+	if err != nil {
+		return nil, err
 	}
 
-	return &leakyBucketOutput{
-		success:    argInts[0] == 1,
-		remaining:  int(argInts[1]),
-		lastFilled: int(argInts[2]),
+	if len(ints) != 2 {
+		return nil, fmt.Errorf("expected 2 args but got %d", len(ints))
+	}
+
+	return &inspectLeakyBucketOutput{
+		remaining:  int(ints[0]),
+		lastFilled: int(ints[1]),
 	}, nil
 }
