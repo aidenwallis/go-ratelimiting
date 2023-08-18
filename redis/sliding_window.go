@@ -14,6 +14,9 @@ import (
 // The sliding window ratelimiter is a fixed size window that holds a set of timestamps. When a token is taken, the current time is added to the window.
 // The window is constantly cleaned, and evicting old tokens, which allows new ones to be added as the window discards old tokens.
 type SlidingWindow interface {
+	// Inspect atomically inspects the sliding window and returns the capacity available. It does not take any tokens.
+	Inspect(ctx context.Context, bucket *SlidingWindowOptions) (*InspectSlidingWindowResponse, error)
+
 	// Use atomically attempts to use the sliding window. Sliding window ratelimiters always take 1 token at a time, as the key is inferred
 	// from when it would expire in nanoseconds.
 	Use(ctx context.Context, bucket *SlidingWindowOptions) (*UseSlidingWindowResponse, error)
@@ -60,6 +63,48 @@ func (r *SlidingWindowImpl) now() time.Time {
 		return time.Now()
 	}
 	return r.nowFunc()
+}
+
+// InspectSlidingWindowResponse defines the response parameters for SlidingWindow.Inspect()
+type InspectSlidingWindowResponse struct {
+	// RemainingCapacity defines the remaining amount of capacity left in the bucket
+	RemainingCapacity int
+}
+
+// Inspect inspects the current state of the sliding window bucket
+func (r *SlidingWindowImpl) Inspect(ctx context.Context, bucket *SlidingWindowOptions) (*InspectSlidingWindowResponse, error) {
+	const script = `
+local key = KEYS[1]
+local now = ARGV[1]
+
+redis.call("zremrangebyscore", key, "-inf", now) -- clear expired tokens
+
+local tokens = tonumber(redis.call("zcard", key))
+if (tokens == nil) then
+	tokens = 0
+end
+
+return tokens
+`
+
+	resp, err := r.Adapter.Eval(ctx, script, []string{bucket.Key}, []interface{}{r.now().UnixNano()})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query redis adapter: %w", err)
+	}
+
+	tokens, ok := resp.(int64)
+	if !ok {
+		return nil, fmt.Errorf("expecting int64 but got %T", resp)
+	}
+
+	remaining := 0
+	if v := bucket.MaximumCapacity - int(tokens); v > 0 {
+		remaining = v
+	}
+
+	return &InspectSlidingWindowResponse{
+		RemainingCapacity: remaining,
+	}, nil
 }
 
 // UseSlidingWindowResponse defines the response parameters for SlidingWindow.Use()
@@ -134,27 +179,17 @@ type slidingWindowOutput struct {
 }
 
 func parseSlidingWindowResponse(v interface{}) (*slidingWindowOutput, error) {
-	args, ok := v.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("expected []interface{} but got %T", v)
+	ints, err := parseRedisInt64Slice(v)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(args) != 2 {
-		return nil, fmt.Errorf("expected 2 args but got %d", len(args))
-	}
-
-	argInts := make([]int64, len(args))
-	for i, argValue := range args {
-		intValue, ok := argValue.(int64)
-		if !ok {
-			return nil, fmt.Errorf("expected int64 in arg[%d] but got %T", i, argValue)
-		}
-
-		argInts[i] = intValue
+	if len(ints) != 2 {
+		return nil, fmt.Errorf("expected 2 args but got %d", len(ints))
 	}
 
 	return &slidingWindowOutput{
-		success: argInts[0] == 1,
-		tokens:  int(argInts[1]),
+		success: ints[0] == 1,
+		tokens:  int(ints[1]),
 	}, nil
 }

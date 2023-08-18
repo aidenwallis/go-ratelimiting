@@ -14,9 +14,84 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestUseLeakyBucket(t *testing.T) {
-	t.Parallel()
+func TestInspectLeakyBucket(t *testing.T) {
+	testCases := map[string]func(*miniredis.Miniredis) adapters.Adapter{
+		"go-redis": func(t *miniredis.Miniredis) adapters.Adapter {
+			return goredisadapter.NewAdapter(goredis.NewClient(&goredis.Options{Addr: t.Addr()}))
+		},
+		"redigo": func(t *miniredis.Miniredis) adapters.Adapter {
+			conn, err := redigo.Dial("tcp", t.Addr())
+			if err != nil {
+				panic(err)
+			}
+			return redigoadapter.NewAdapter(conn)
+		},
+	}
 
+	for name, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now().UTC()
+			limiter := NewLeakyBucket(testCase(miniredis.RunT(t)))
+			limiter.nowFunc = func() time.Time { return now }
+
+			{
+				resp, err := limiter.Inspect(ctx, leakyBucketOptions())
+				assert.NoError(t, err)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity, resp.RemainingTokens)
+				assert.Equal(t, now.Unix(), resp.ResetAt.Unix())
+			}
+
+			{
+				resp, err := useLeakyBucket(ctx, limiter)
+				assert.NoError(t, err)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingTokens)
+				assert.Equal(t, now.Add(time.Second*1).Unix(), resp.ResetAt.Unix())
+			}
+
+			{
+				resp, err := limiter.Inspect(ctx, leakyBucketOptions())
+				assert.NoError(t, err)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingTokens)
+				assert.Equal(t, now.Add(time.Second*1).Unix(), resp.ResetAt.Unix())
+			}
+		})
+	}
+}
+
+func TestInspectLeakyBucket_Errors(t *testing.T) {
+	testCases := map[string]struct {
+		errorMessage string
+		mockAdapter  adapters.Adapter
+	}{
+		"redis error": {
+			errorMessage: "failed to query redis adapter: " + assert.AnError.Error(),
+			mockAdapter: &mockAdapter{
+				returnError: assert.AnError,
+			},
+		},
+		"parsing error": {
+			errorMessage: "parsing redis response: expected []interface{} but got string",
+			mockAdapter: &mockAdapter{
+				returnValue: "foo",
+			},
+		},
+	}
+
+	for name, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(name, func(t *testing.T) {
+			out, err := NewLeakyBucket(testCase.mockAdapter).Inspect(context.Background(), leakyBucketOptions())
+			assert.Nil(t, out)
+			assert.EqualError(t, err, testCase.errorMessage)
+		})
+	}
+}
+
+func TestUseLeakyBucket(t *testing.T) {
 	testCases := map[string]func(*miniredis.Miniredis) adapters.Adapter{
 		"go-redis": func(t *miniredis.Miniredis) adapters.Adapter {
 			return goredisadapter.NewAdapter(goredis.NewClient(&goredis.Options{Addr: t.Addr()}))
@@ -108,7 +183,7 @@ func TestRefillRate(t *testing.T) {
 	assert.EqualValues(t, 5, getRefillRate(300, 60))
 }
 
-func TestParseLeakyBucketResponse_Errors(t *testing.T) {
+func TestParseUseLeakyBucketResponse_Errors(t *testing.T) {
 	testCases := map[string]struct {
 		errorMessage string
 		in           interface{}
@@ -119,11 +194,7 @@ func TestParseLeakyBucketResponse_Errors(t *testing.T) {
 		},
 		"invalid length": {
 			errorMessage: "expected 3 args but got 2",
-			in:           []interface{}{1, 2},
-		},
-		"invalid item type": {
-			errorMessage: "expected int64 in arg[1] but got float64",
-			in:           []interface{}{int64(1), float64(2), "three"},
+			in:           []interface{}{int64(1), int64(2)},
 		},
 	}
 
@@ -131,7 +202,33 @@ func TestParseLeakyBucketResponse_Errors(t *testing.T) {
 		testCase := testCase
 
 		t.Run(name, func(t *testing.T) {
-			out, err := parseLeakyBucketResponse(testCase.in)
+			out, err := parseUseLeakyBucketResponse(testCase.in)
+			assert.Nil(t, out)
+			assert.EqualError(t, err, testCase.errorMessage)
+		})
+	}
+}
+
+func TestParseInspectLeakyBucketResponse_Errors(t *testing.T) {
+	testCases := map[string]struct {
+		errorMessage string
+		in           interface{}
+	}{
+		"invalid type": {
+			errorMessage: "expected []interface{} but got string",
+			in:           "foo",
+		},
+		"invalid length": {
+			errorMessage: "expected 2 args but got 3",
+			in:           []interface{}{int64(1), int64(2), int64(3)},
+		},
+	}
+
+	for name, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(name, func(t *testing.T) {
+			out, err := parseInspectLeakyBucketResponse(testCase.in)
 			assert.Nil(t, out)
 			assert.EqualError(t, err, testCase.errorMessage)
 		})

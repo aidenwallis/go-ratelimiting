@@ -20,6 +20,84 @@ func TestSlidingWindow_Now(t *testing.T) {
 	assert.WithinDuration(t, adapter.now(), time.Now(), time.Minute)
 }
 
+func TestInspectSlidingWindow(t *testing.T) {
+	testCases := map[string]func(*miniredis.Miniredis) adapters.Adapter{
+		"go-redis": func(t *miniredis.Miniredis) adapters.Adapter {
+			return goredisadapter.NewAdapter(goredis.NewClient(&goredis.Options{Addr: t.Addr()}))
+		},
+		"redigo": func(t *miniredis.Miniredis) adapters.Adapter {
+			conn, err := redigo.Dial("tcp", t.Addr())
+			if err != nil {
+				panic(err)
+			}
+			return redigoadapter.NewAdapter(conn)
+		},
+	}
+
+	for name, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now().UTC()
+			limiter := NewSlidingWindow(testCase(miniredis.RunT(t)))
+			limiter.nowFunc = func() time.Time { return now }
+
+			{
+				// should default to 0
+				resp, err := limiter.Inspect(ctx, slidingWindowOptions())
+				assert.NoError(t, err)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity, resp.RemainingCapacity)
+			}
+
+			{
+				// use the bucket
+				resp, err := useSlidingWindow(ctx, limiter)
+				assert.NoError(t, err)
+				assert.True(t, resp.Success)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingCapacity)
+			}
+
+			{
+				// inspect again, 1 token should be missing
+				resp, err := limiter.Inspect(ctx, slidingWindowOptions())
+				assert.NoError(t, err)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingCapacity)
+			}
+		})
+	}
+}
+
+func TestInspectSlidingWindow_Errors(t *testing.T) {
+	testCases := map[string]struct {
+		errorMessage string
+		mockAdapter  adapters.Adapter
+	}{
+		"redis error": {
+			errorMessage: "failed to query redis adapter: " + assert.AnError.Error(),
+			mockAdapter: &mockAdapter{
+				returnError: assert.AnError,
+			},
+		},
+		"parsing error": {
+			errorMessage: "expecting int64 but got string",
+			mockAdapter: &mockAdapter{
+				returnValue: "foo",
+			},
+		},
+	}
+
+	for name, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(name, func(t *testing.T) {
+			out, err := NewSlidingWindow(testCase.mockAdapter).Inspect(context.Background(), slidingWindowOptions())
+			assert.Nil(t, out)
+			assert.EqualError(t, err, testCase.errorMessage)
+		})
+	}
+}
+
 func TestUseSlidingWindow(t *testing.T) {
 	testCases := map[string]func(*miniredis.Miniredis) adapters.Adapter{
 		"go-redis": func(t *miniredis.Miniredis) adapters.Adapter {
@@ -124,11 +202,7 @@ func TestParseSlidingWindowResponse_Errors(t *testing.T) {
 		},
 		"invalid length": {
 			errorMessage: "expected 2 args but got 3",
-			in:           []interface{}{1, 2, 3},
-		},
-		"invalid item type": {
-			errorMessage: "expected int64 in arg[1] but got float64",
-			in:           []interface{}{int64(1), float64(2)},
+			in:           []interface{}{int64(1), int64(2), int64(3)},
 		},
 	}
 
