@@ -10,6 +10,15 @@ import (
 )
 
 // LeakyBucket defines an interface compatible with LeakyBucketImpl
+//
+// Leaky buckets have the advantage of being able to burst up to the max tokens you define, and then slowly leak out tokens at a constant rate. This makes
+// it a good fit for situations where you want caller buckets to slowly fill if they decide to burst your service, whereas a sliding window ratelimiter will
+// free all tokens at once.
+//
+// Leaky buckets slowly fill your window over time, and will not fill above the size of the window. For example, if you allow 10 tokens per a window of 1 second,
+// your bucket fills at a fixed rate of 100ms.
+//
+// See: https://en.wikipedia.org/wiki/Leaky_bucket
 type LeakyBucket interface {
 	// Use atomically attempts to use the leaky bucket. Use takeAmount to set how many tokens should be attempted to be removed
 	// from the bucket: they are atomic, either all tokens are taken, or the ratelimit is unsuccessful.
@@ -53,7 +62,9 @@ type UseLeakyBucketResponse struct {
 	ResetAt time.Time
 }
 
-// LeakyBucketImpl implements a leaky bucket ratelimiter, this struct is compatible with the LeakyBucket interface
+// LeakyBucketImpl implements a leaky bucket ratelimiter in Redis with Lua. This struct is compatible with the LeakyBucket interface
+//
+// See the LeakyBucket interface for more information about leaky bucket ratelimiters.
 type LeakyBucketImpl struct {
 	// Adapter defines the Redis adapter
 	Adapter adapters.Adapter

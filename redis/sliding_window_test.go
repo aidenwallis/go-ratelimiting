@@ -14,9 +14,13 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestUseLeakyBucket(t *testing.T) {
-	t.Parallel()
+func TestSlidingWindow_Now(t *testing.T) {
+	adapter := NewSlidingWindow(nil)
+	adapter.nowFunc = nil
+	assert.WithinDuration(t, adapter.now(), time.Now(), time.Minute)
+}
 
+func TestUseSlidingWindow(t *testing.T) {
 	testCases := map[string]func(*miniredis.Miniredis) adapters.Adapter{
 		"go-redis": func(t *miniredis.Miniredis) adapters.Adapter {
 			return goredisadapter.NewAdapter(goredis.NewClient(&goredis.Options{Addr: t.Addr()}))
@@ -36,43 +40,50 @@ func TestUseLeakyBucket(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			now := time.Now().UTC()
-			limiter := NewLeakyBucket(testCase(miniredis.RunT(t)))
+			limiter := NewSlidingWindow(testCase(miniredis.RunT(t)))
 			limiter.nowFunc = func() time.Time { return now }
 
 			{
-				resp, err := useLeakyBucket(ctx, limiter)
+				resp, err := useSlidingWindow(ctx, limiter)
 				assert.NoError(t, err)
-				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingTokens)
-				assert.Equal(t, now.Add(time.Second).Unix(), resp.ResetAt.Unix())
-			}
-
-			{
-				resp, err := useLeakyBucket(ctx, limiter)
-				assert.NoError(t, err)
-				assert.Equal(t, leakyBucketOptions().MaximumCapacity-2, resp.RemainingTokens)
-				assert.Equal(t, now.Add(time.Second*2).Unix(), resp.ResetAt.Unix())
+				assert.True(t, resp.Success)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingCapacity)
 			}
 
 			// move forward 3 seconds
 			limiter.nowFunc = func() time.Time { return now.Add(time.Second * 3) }
 
 			{
-				resp, err := useLeakyBucket(ctx, limiter)
+				resp, err := useSlidingWindow(ctx, limiter)
 				assert.NoError(t, err)
-				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingTokens)
-				assert.Equal(t, now.Add(time.Second*4).Unix(), resp.ResetAt.Unix())
+				assert.True(t, resp.Success)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-2, resp.RemainingCapacity, "tokens shouldn't have expired yet")
+			}
+
+			// move forward 60 seconds
+			limiter.nowFunc = func() time.Time { return now.Add(time.Second * 60) }
+
+			{
+				resp, err := useSlidingWindow(ctx, limiter)
+				assert.NoError(t, err)
+				assert.True(t, resp.Success)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-2, resp.RemainingCapacity, "one token should've expired, so including this request, 2 should be used")
+			}
+
+			// move forward 120 seconds
+			limiter.nowFunc = func() time.Time { return now.Add(time.Second * 120) }
+
+			{
+				resp, err := useSlidingWindow(ctx, limiter)
+				assert.NoError(t, err)
+				assert.True(t, resp.Success)
+				assert.Equal(t, leakyBucketOptions().MaximumCapacity-1, resp.RemainingCapacity, "all tokens should've expired by now, so only this one is left")
 			}
 		})
 	}
 }
 
-func TestLeakyBucket_Now(t *testing.T) {
-	adapter := NewLeakyBucket(nil)
-	adapter.nowFunc = nil
-	assert.WithinDuration(t, adapter.now(), time.Now(), time.Minute)
-}
-
-func TestUseLeakyBucket_Errors(t *testing.T) {
+func TestUseSlidingWindow_Errors(t *testing.T) {
 	testCases := map[string]struct {
 		errorMessage string
 		mockAdapter  adapters.Adapter
@@ -95,20 +106,14 @@ func TestUseLeakyBucket_Errors(t *testing.T) {
 		testCase := testCase
 
 		t.Run(name, func(t *testing.T) {
-			out, err := useLeakyBucket(context.Background(), NewLeakyBucket(testCase.mockAdapter))
+			out, err := useSlidingWindow(context.Background(), NewSlidingWindow(testCase.mockAdapter))
 			assert.Nil(t, out)
 			assert.EqualError(t, err, testCase.errorMessage)
 		})
 	}
 }
 
-func TestRefillRate(t *testing.T) {
-	assert.EqualValues(t, 1.5, getRefillRate(90, 60))
-	assert.EqualValues(t, 1, getRefillRate(60, 60))
-	assert.EqualValues(t, 5, getRefillRate(300, 60))
-}
-
-func TestParseLeakyBucketResponse_Errors(t *testing.T) {
+func TestParseSlidingWindowResponse_Errors(t *testing.T) {
 	testCases := map[string]struct {
 		errorMessage string
 		in           interface{}
@@ -118,12 +123,12 @@ func TestParseLeakyBucketResponse_Errors(t *testing.T) {
 			in:           "foo",
 		},
 		"invalid length": {
-			errorMessage: "expected 3 args but got 2",
-			in:           []interface{}{1, 2},
+			errorMessage: "expected 2 args but got 3",
+			in:           []interface{}{1, 2, 3},
 		},
 		"invalid item type": {
 			errorMessage: "expected int64 in arg[1] but got float64",
-			in:           []interface{}{int64(1), float64(2), "three"},
+			in:           []interface{}{int64(1), float64(2)},
 		},
 	}
 
@@ -131,23 +136,23 @@ func TestParseLeakyBucketResponse_Errors(t *testing.T) {
 		testCase := testCase
 
 		t.Run(name, func(t *testing.T) {
-			out, err := parseLeakyBucketResponse(testCase.in)
+			out, err := parseSlidingWindowResponse(testCase.in)
 			assert.Nil(t, out)
 			assert.EqualError(t, err, testCase.errorMessage)
 		})
 	}
 }
 
-// leakyBucketOptions provides quick sane defaults for testing leaky buckets
-func leakyBucketOptions() *LeakyBucketOptions {
-	return &LeakyBucketOptions{
-		KeyPrefix:       "test-bucket",
+// slidingWindowOptions provides quick sane defaults for testing sliding windows
+func slidingWindowOptions() *SlidingWindowOptions {
+	return &SlidingWindowOptions{
+		Key:             "test-bucket",
 		MaximumCapacity: 60,
-		WindowSeconds:   60,
+		Window:          time.Minute,
 	}
 }
 
-// useLeakyBucket is a helper to test your leaky bucket with some predefined options
-func useLeakyBucket(ctx context.Context, limiter LeakyBucket) (*UseLeakyBucketResponse, error) {
-	return limiter.Use(ctx, leakyBucketOptions(), 1)
+// useSlidingWindow is a helper to test your sliding window with some predefined options
+func useSlidingWindow(ctx context.Context, limiter SlidingWindow) (*UseSlidingWindowResponse, error) {
+	return limiter.Use(ctx, slidingWindowOptions())
 }
